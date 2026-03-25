@@ -1,4 +1,4 @@
-import os, sys, math, gc, json, warnings, shutil, types, re
+import os, sys, math, gc, json, warnings, shutil, types, re, time
 from functools import partial
 from itertools import product
 import torch
@@ -300,6 +300,7 @@ class CLASE_LOT_and_STATS:
             return math.exp(min(avg_loss, 20))
             
         def run(self):
+            start_time = time.time()
             cfg = self.parent.config
             pools, _ = self.parent.data_handler.prepare_dataset()
             global_results = []
@@ -379,7 +380,13 @@ class CLASE_LOT_and_STATS:
                 self.parent.stats.run_kruskal_wallis(df_res)
             except:
                 pass
+                
+            elapsed = time.time() - start_time
+            hours, rem = divmod(elapsed, 3600)
+            mins, secs = divmod(rem, 60)
+            
             self.parent.accelerator.print(f"\n[INFO] Experimento Completado. Archivos generados en: {self.parent.base_dir}")
+            self.parent.accelerator.print(f"[INFO] Tiempo Total de Entrenamiento: {int(hours):02d}h {int(mins):02d}m {secs:05.2f}s")
 
 def main():
     app = CLASE_LOT_and_STATS(ACTIVE_CONFIG)
