@@ -1,3 +1,6 @@
 .env
 Exp_*/
 env_spacy/
+University_*
+__pycache__/
+*.pyc
