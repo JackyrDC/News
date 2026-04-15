@@ -387,7 +387,7 @@ class CLASE_LOT_and_STATS:
             
             self.parent.accelerator.print(f"\n[INFO] Experimento Completado. Archivos generados en: {self.parent.base_dir}")
             self.parent.accelerator.print(f"[INFO] Tiempo Total de Entrenamiento: {int(hours):02d}h {int(mins):02d}m {secs:05.2f}s")
-
+            self.parent.accelerator.print(self.parent.accelerator.device)
 def main():
     app = CLASE_LOT_and_STATS(ACTIVE_CONFIG)
     app.orchestrator.run()
