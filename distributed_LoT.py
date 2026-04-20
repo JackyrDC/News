@@ -31,7 +31,7 @@ BASE_DRIVE_PATH = f'./University_MATH/{OUTS}'
 DATASET_FULL_PATH = './University_MATH/x.json'
 
 QUICK_CONFIG = {
-    "run_config": {"experiment_name": "Exp_L_QQQ_Advanced", "num_replicas": 2, "device": "cuda" if torch.cuda.is_available() else "cpu", "metric_for_hypothesis_testing": "RLCT"},
+    "run_config": {"experiment_name": "Exp_L_QQQ_Advanced", "num_replicas": 5, "device": "cuda" if torch.cuda.is_available() else "cpu", "metric_for_hypothesis_testing": "RLCT"},
     "data_config": {"dataset_path": DATASET_FULL_PATH, "samples_in_balance": 10, "finetune_budget": 10, "max_seq_len": 64},
     "model_config": {"base_model_id": "openai-community/gpt2", "lora_config": {"r": 4, "lora_alpha": 8, "target_modules": ["c_attn"], "fan_in_fan_out": True}},
     "training_config": {"max_steps": 5, "learning_rate": 1e-4, "per_device_train_batch_size": 2, "logging_steps": 1},
