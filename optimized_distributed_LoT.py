@@ -31,7 +31,7 @@ BASE_DRIVE_PATH = f'./University_MATH/{OUTS}'
 DATASET_FULL_PATH = './University_MATH/x.json'
 
 QUICK_CONFIG = {
-    "run_config": {"experiment_name": "Exp_L_QQQ_Advanced", "num_replicas": 5, "device": "cuda" if torch.cuda.is_available() else "cpu", "metric_for_hypothesis_testing": "RLCT"},
+    "run_config": {"experiment_name": "Exp_L_QQQ_Advanced", "num_replicas": 10, "device": "cuda" if torch.cuda.is_available() else "cpu", "metric_for_hypothesis_testing": "RLCT"},
     "data_config": {"dataset_path": DATASET_FULL_PATH, "samples_in_balance": 10, "finetune_budget": 10, "max_seq_len": 64},
     "model_config": {"base_model_id": "openai-community/gpt2", "lora_config": {"r": 4, "lora_alpha": 8, "target_modules": ["c_attn"], "fan_in_fan_out": True}},
     "training_config": {"max_steps": 5, "learning_rate": 1e-4, "per_device_train_batch_size": 2, "logging_steps": 1, "use_deepspeed": True},
@@ -200,7 +200,8 @@ class CLASE_LOT_and_STATS:
                     text = f"{d['instruction']} {d.get('response', '')}"
                     tokens = self.parent.tokenizer(text, return_tensors="pt", truncation=True, max_length=64).to(self.parent.device)
                     out = model(**tokens, output_hidden_states=True)
-                    traj.append(np.stack([h[0, -1, :].cpu().numpy() for h in out.hidden_states], axis=0))
+                    # Cast to float32 before numpy to avoid TypeError: Got unsupported ScalarType BFloat16
+                    traj.append(np.stack([h[0, -1, :].to(torch.float32).cpu().numpy() for h in out.hidden_states], axis=0))
                     del out, tokens
             if not traj: return None
             M = np.stack(traj, axis=2)
@@ -282,7 +283,7 @@ class CLASE_LOT_and_STATS:
             return {
                 "zero_optimization": {
                     "stage": 2,
-                    "offload_optimizer": {"device": "cpu", "pin_memory": True},
+                    # "offload_optimizer": {"device": "cpu", "pin_memory": True},
                     "allgather_partitions": True,
                     "allgather_bucket_size": 2e8,
                     "overlap_comm": True,
