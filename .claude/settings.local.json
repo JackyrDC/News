@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(///wsl.localhost/Ubuntu-24.04/home/jack/**)",
+      "Bash(python3 -c \"import json; data = json.load\\(open\\('x.json'\\)\\); print\\(f'Records: {len\\(data\\)}'\\); print\\('Keys:', list\\(data[0].keys\\(\\)\\) if data else 'empty'\\); print\\('Sample:', data[0] if data else 'empty'\\)\")",
+      "Bash(find . -type f \\\\\\( -name \"README*\" -o -name \"*.md\" -o -name \"*.txt\" \\\\\\) -not -path \"./.git/*\")"
+    ]
+  }
+}

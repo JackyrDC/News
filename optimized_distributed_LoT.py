@@ -34,7 +34,7 @@ QUICK_CONFIG = {
     "run_config": {"experiment_name": "Exp_L_QQQ_Advanced", "num_replicas": 5, "device": "cuda" if torch.cuda.is_available() else "cpu", "metric_for_hypothesis_testing": "RLCT"},
     "data_config": {"dataset_path": DATASET_FULL_PATH, "samples_in_balance": 10, "finetune_budget": 10, "max_seq_len": 64},
     "model_config": {"base_model_id": "openai-community/gpt2", "lora_config": {"r": 4, "lora_alpha": 8, "target_modules": ["c_attn"], "fan_in_fan_out": True}},
-    "training_config": {"max_steps": 5, "learning_rate": 1e-4, "per_device_train_batch_size": 2, "logging_steps": 1},
+    "training_config": {"max_steps": 5, "learning_rate": 1e-4, "per_device_train_batch_size": 2, "logging_steps": 1, "use_deepspeed": True},
     "rlct_config": {"max_rlct_estimation_steps": 5, "sgld_lr": 1e-4},
     "lot_config": {"num_trajectories": 50, "n_tokens": 25, "use_alternating_source": True}
 }
@@ -161,20 +161,27 @@ class CLASE_LOT_and_STATS:
             cfg = self.parent.config['rlct_config']
             n = max(1, len(dataset))
             beta1, beta2 = 1.0 / np.log(n), 1.3 / np.log(n)
+            # No llamar accelerator.prepare() aquí: el Accelerator compartido acumula
+            # referencias en _models/_optimizers sin liberarlas jamás (leak principal).
+            # El modelo ya está en el device correcto desde from_pretrained().to(device).
             optimizer = self.SGLD(model.parameters(), lr=cfg['sgld_lr'], temperature=1.0 / beta1)
-            model, optimizer = self.parent.accelerator.prepare(model, optimizer)
             energies = []
             model.train()
 
-            for i in range(min(n, cfg["max_rlct_estimation_steps"])):
-                sample = dataset[i % n]
-                text = f"{sample['instruction']}\n{sample.get('response', '')}"
-                inputs = self.parent.tokenizer(text, return_tensors="pt", truncation=True, max_length=64).to(self.parent.device)
-                optimizer.zero_grad()
-                loss = model(**inputs, labels=inputs["input_ids"]).loss
-                loss.backward()
-                optimizer.step()
-                energies.append(loss.item() * n)
+            try:
+                for i in range(min(n, cfg["max_rlct_estimation_steps"])):
+                    sample = dataset[i % n]
+                    text = f"{sample['instruction']}\n{sample.get('response', '')}"
+                    inputs = self.parent.tokenizer(text, return_tensors="pt", truncation=True, max_length=64).to(self.parent.device)
+                    optimizer.zero_grad()
+                    loss = model(**inputs, labels=inputs["input_ids"]).loss
+                    loss.backward()
+                    optimizer.step()
+                    energies.append(loss.item() * n)
+                    del inputs, loss
+            finally:
+                del optimizer
+                gc.collect()
 
             if not energies: return 0.0, []
             V = np.array(energies)
@@ -194,6 +201,7 @@ class CLASE_LOT_and_STATS:
                     tokens = self.parent.tokenizer(text, return_tensors="pt", truncation=True, max_length=64).to(self.parent.device)
                     out = model(**tokens, output_hidden_states=True)
                     traj.append(np.stack([h[0, -1, :].cpu().numpy() for h in out.hidden_states], axis=0))
+                    del out, tokens
             if not traj: return None
             M = np.stack(traj, axis=2)
             NL, _, _ = M.shape
@@ -250,6 +258,7 @@ class CLASE_LOT_and_STATS:
                 for s in tqdm(sentences, desc="Tracing", leave=False):
                     out = self.current_model(s.unsqueeze(0).to(self.current_model.device), output_hidden_states=True)
                     trajectories.append(np.stack([h[0, -1, :].float().cpu().numpy() for h in out.hidden_states], axis=1))
+                    del out
             return np.stack(trajectories, axis=2)[:, 1:, :] if trajectories else None
 
         def run_full_analysis(self, lot_config, dolly_dataset):
@@ -266,6 +275,28 @@ class CLASE_LOT_and_STATS:
 
     class ExperimentOrchestrator:
         def __init__(self, parent): self.parent = parent
+        @staticmethod
+        def _build_ds_config(batch_size: int) -> dict:
+            # ZeRO-2 + CPU offload de optimizer states: libera ~2x tamaño del modelo en VRAM.
+            # Funciona en GPU única; no requiere multi-GPU para ser útil.
+            return {
+                "zero_optimization": {
+                    "stage": 2,
+                    "offload_optimizer": {"device": "cpu", "pin_memory": True},
+                    "allgather_partitions": True,
+                    "allgather_bucket_size": 2e8,
+                    "overlap_comm": True,
+                    "reduce_scatter": True,
+                    "reduce_bucket_size": 2e8,
+                    "contiguous_gradients": True,
+                },
+                "bf16": {"enabled": True},
+                "gradient_clipping": 1.0,
+                "train_micro_batch_size_per_gpu": batch_size,
+                "gradient_accumulation_steps": 1,
+                "wall_clock_breakdown": False,
+            }
+
         @staticmethod
         def tokenize_batch_fn(batch, tokenizer, max_len):
             resps = batch.get('response', [''] * len(batch['instruction']))
@@ -296,6 +327,7 @@ class CLASE_LOT_and_STATS:
                     if not torch.isnan(loss):
                         total_loss += loss.item()
                         count += 1
+                    del inputs, loss
             avg_loss = total_loss / count if count > 0 else 100.0
             return math.exp(min(avg_loss, 20))
 
@@ -306,34 +338,49 @@ class CLASE_LOT_and_STATS:
             global_results = []
             max_len = cfg['data_config']['max_seq_len']
             tokenize_fn = partial(self.tokenize_batch_fn, tokenizer=self.parent.tokenizer, max_len=max_len)
+            use_bf16 = (self.parent.device.type == "cuda")
+            use_deepspeed = use_bf16 and cfg["training_config"].get("use_deepspeed", False)
+
+            # Tokenizar una sola vez por pool (no por réplica): evita recrear datasets en memoria
+            tokenized_pools = {
+                name: ds.map(tokenize_fn, batched=True, load_from_cache_file=False)
+                for name, ds in pools.items()
+            }
 
             for rep in range(cfg["run_config"]["num_replicas"]):
                 for treat_name, pool_ds in pools.items():
-                    tokenized_pool_ds = pool_ds.map(tokenize_fn, batched=True)
+                    tokenized_pool_ds = tokenized_pools[treat_name]
                     for method in ["LORA_Standard", "LORA_XS"]:
                         run_id = f"Rep{rep}_{treat_name}_{method}"
                         self.parent.accelerator.print(f"\n[{run_id}] Iniciando Pipeline...")
                         run_dir = os.path.join(self.parent.base_dir, run_id)
                         os.makedirs(run_dir, exist_ok=True)
 
-                        base_model = AutoModelForCausalLM.from_pretrained(cfg["model_config"]["base_model_id"]).to(self.parent.device)
+                        load_kwargs = {"torch_dtype": torch.bfloat16} if use_bf16 else {}
+                        base_model = AutoModelForCausalLM.from_pretrained(
+                            cfg["model_config"]["base_model_id"], **load_kwargs
+                        ).to(self.parent.device)
                         peft_cfg = LoraConfig(task_type="CAUSAL_LM", **cfg["model_config"]["lora_config"])
                         peft_model = get_peft_model(base_model, peft_cfg)
 
                         if method == "LORA_XS":
                             peft_model = self.parent.lora_xs.transmute_to_loraxs(peft_model, rank=peft_cfg.r)
 
+                        batch_size = cfg["training_config"]["per_device_train_batch_size"]
+                        ds_config = self._build_ds_config(batch_size) if use_deepspeed else None
                         trainer = Trainer(
                             model=peft_model,
                             args=TrainingArguments(
                                 output_dir=os.path.join(run_dir, "ckpt"),
                                 max_steps=cfg["training_config"]["max_steps"],
                                 learning_rate=cfg["training_config"]["learning_rate"],
-                                per_device_train_batch_size=cfg["training_config"]["per_device_train_batch_size"],
+                                per_device_train_batch_size=batch_size,
                                 logging_steps=cfg["training_config"]["logging_steps"],
                                 report_to="none",
                                 save_strategy="no",
-                                remove_unused_columns=True
+                                remove_unused_columns=True,
+                                bf16=use_bf16,
+                                deepspeed=ds_config,
                             ),
                             train_dataset=tokenized_pool_ds,
                             data_collator=DataCollatorForLanguageModeling(self.parent.tokenizer, mlm=False)
@@ -342,6 +389,13 @@ class CLASE_LOT_and_STATS:
 
                         if self.parent.accelerator.is_main_process:
                             self.plot_training_history(trainer.state.log_history, run_id, run_dir)
+
+                        # Liberar el Accelerator interno del Trainer antes de borrar
+                        if hasattr(trainer, "accelerator"):
+                            trainer.accelerator.free_memory()
+                        del trainer
+                        gc.collect()
+                        torch.cuda.empty_cache()
 
                         ppl = self.calculate_ppl(peft_model, pool_ds)
 
@@ -368,7 +422,7 @@ class CLASE_LOT_and_STATS:
                             "PPL": ppl
                         })
 
-                        del peft_model, base_model, trainer
+                        del peft_model, base_model, math_res, energies
                         gc.collect()
                         torch.cuda.empty_cache()
 
@@ -388,6 +442,7 @@ class CLASE_LOT_and_STATS:
             self.parent.accelerator.print(f"\n[INFO] Experimento Completado. Archivos generados en: {self.parent.base_dir}")
             self.parent.accelerator.print(f"[INFO] Tiempo Total de Entrenamiento: {int(hours):02d}h {int(mins):02d}m {secs:05.2f}s")
             self.parent.accelerator.print(self.parent.accelerator.device)
+
 def main():
     app = CLASE_LOT_and_STATS(ACTIVE_CONFIG)
     app.orchestrator.run()
