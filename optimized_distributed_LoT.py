@@ -27,8 +27,9 @@ warnings.filterwarnings('ignore')
 plt.rcParams.update({"font.family": "serif", "font.serif": ["cmr10", "DejaVu Serif", "Bitstream Vera Serif"], "mathtext.fontset": "cm", "axes.labelsize": 14, "font.size": 12, "legend.fontsize": 12, "xtick.labelsize": 12, "ytick.labelsize": 12, "figure.figsize": [10, 8], "image.cmap": "jet", "axes.formatter.use_mathtext": True})
 
 OUTS = 'L_kw_nL_Advanced'
-BASE_DRIVE_PATH = f'./University_MATH/{OUTS}'
-DATASET_FULL_PATH = './University_MATH/x.json'
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DRIVE_PATH = os.path.join(_SCRIPT_DIR, 'University_MATH', OUTS)
+DATASET_FULL_PATH = os.path.join(_SCRIPT_DIR, 'University_MATH', 'x.json')
 
 QUICK_CONFIG = {
     "run_config": {"experiment_name": "Exp_L_QQQ_Advanced", "num_replicas": 10, "device": "cuda" if torch.cuda.is_available() else "cpu", "metric_for_hypothesis_testing": "RLCT"},
@@ -43,12 +44,18 @@ ACTIVE_CONFIG = QUICK_CONFIG
 class CLASE_LOT_and_STATS:
     def __init__(self, master_config: dict):
         self.config = master_config
+        # Accelerator sin DeepSpeed: solo gestiona device y comunicación entre ranks.
+        # El Trainer crea su propio Accelerator interno para DeepSpeed; no pasamos
+        # deepspeed aquí para evitar doble inicialización del process group.
         self.accelerator = Accelerator()
         self.device = self.accelerator.device
         self.base_dir = BASE_DRIVE_PATH
-        os.makedirs(self.base_dir, exist_ok=True)
+        if self.accelerator.is_main_process:
+            os.makedirs(self.base_dir, exist_ok=True)
+        self.accelerator.wait_for_everyone()
         self.accelerator.print(f"=== INICIALIZANDO EXPERIMENTO: {self.config['run_config']['experiment_name']} ===")
         self.accelerator.print(f"Directorio de salida: {self.base_dir}")
+        self.accelerator.print(f"Rank {self.accelerator.process_index} / {self.accelerator.num_processes} en {self.device}")
         self.nlp = spacy.load("en_core_web_sm")
         self.tokenizer = AutoTokenizer.from_pretrained(self.config['model_config']['base_model_id'])
         self.tokenizer.pad_token = self.tokenizer.pad_token if self.tokenizer.pad_token is not None else self.tokenizer.eos_token
@@ -60,13 +67,16 @@ class CLASE_LOT_and_STATS:
         self.visualizer = self.TrajectoryVisualizer(self)
         self.stats = self.StatisticalAnalysis(self)
         self.orchestrator = self.ExperimentOrchestrator(self)
-        self.doc_gen.write_math_foundations()
+        if self.accelerator.is_main_process:
+            self.doc_gen.write_math_foundations()
+        self.accelerator.wait_for_everyone()
 
     class ExperimentDocumentationGenerator:
         def __init__(self, parent):
             self.parent = parent
             self.txt_dir = os.path.join(parent.base_dir, "Theoretical_Foundations")
-            os.makedirs(self.txt_dir, exist_ok=True)
+            if parent.accelerator.is_main_process:
+                os.makedirs(self.txt_dir, exist_ok=True)
         def write_math_foundations(self):
             content = r"\section{Fundamentos Matemáticos}"
             with open(os.path.join(self.txt_dir, "Math_Foundations.txt"), "w", encoding="utf-8") as f:
@@ -340,7 +350,9 @@ class CLASE_LOT_and_STATS:
             max_len = cfg['data_config']['max_seq_len']
             tokenize_fn = partial(self.tokenize_batch_fn, tokenizer=self.parent.tokenizer, max_len=max_len)
             use_bf16 = (self.parent.device.type == "cuda")
-            use_deepspeed = use_bf16 and cfg["training_config"].get("use_deepspeed", False)
+            # DeepSpeed solo se activa en multi-GPU; en CPU/single-GPU se omite para evitar
+            # conflictos con el Accelerator externo ya inicializado.
+            use_deepspeed = use_bf16 and cfg["training_config"].get("use_deepspeed", False) and self.parent.accelerator.num_processes > 1
 
             # Tokenizar una sola vez por pool (no por réplica): evita recrear datasets en memoria
             tokenized_pools = {
@@ -355,7 +367,9 @@ class CLASE_LOT_and_STATS:
                         run_id = f"Rep{rep}_{treat_name}_{method}"
                         self.parent.accelerator.print(f"\n[{run_id}] Iniciando Pipeline...")
                         run_dir = os.path.join(self.parent.base_dir, run_id)
-                        os.makedirs(run_dir, exist_ok=True)
+                        if self.parent.accelerator.is_main_process:
+                            os.makedirs(run_dir, exist_ok=True)
+                        self.parent.accelerator.wait_for_everyone()
 
                         load_kwargs = {"torch_dtype": torch.bfloat16} if use_bf16 else {}
                         base_model = AutoModelForCausalLM.from_pretrained(
