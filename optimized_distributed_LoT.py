@@ -44,9 +44,6 @@ ACTIVE_CONFIG = QUICK_CONFIG
 class CLASE_LOT_and_STATS:
     def __init__(self, master_config: dict):
         self.config = master_config
-        # Accelerator sin DeepSpeed: solo gestiona device y comunicación entre ranks.
-        # El Trainer crea su propio Accelerator interno para DeepSpeed; no pasamos
-        # deepspeed aquí para evitar doble inicialización del process group.
         self.accelerator = Accelerator()
         self.device = self.accelerator.device
         self.base_dir = BASE_DRIVE_PATH
@@ -288,9 +285,7 @@ class CLASE_LOT_and_STATS:
         def __init__(self, parent): self.parent = parent
         @staticmethod
         def _build_ds_config(batch_size: int) -> dict:
-            # ZeRO-2 + CPU offload de optimizer states: libera ~2x tamaño del modelo en VRAM.
-            # Funciona en GPU única; no requiere multi-GPU para ser útil.
-            return {
+           return {
                 "zero_optimization": {
                     "stage": 2,
                     # "offload_optimizer": {"device": "cpu", "pin_memory": True},
@@ -349,16 +344,17 @@ class CLASE_LOT_and_STATS:
             global_results = []
             max_len = cfg['data_config']['max_seq_len']
             tokenize_fn = partial(self.tokenize_batch_fn, tokenizer=self.parent.tokenizer, max_len=max_len)
-            use_bf16 = (self.parent.device.type == "cuda")
-            # DeepSpeed solo se activa en multi-GPU; en CPU/single-GPU se omite para evitar
-            # conflictos con el Accelerator externo ya inicializado.
-            use_deepspeed = use_bf16 and cfg["training_config"].get("use_deepspeed", False) and self.parent.accelerator.num_processes > 1
+            use_bf16 = (self.parent.device.type == "cuda" and torch.cuda.is_bf16_supported())
+            use_deepspeed = use_bf16 and cfg["training_config"].get("use_deepspeed", False)
 
             # Tokenizar una sola vez por pool (no por réplica): evita recrear datasets en memoria
             tokenized_pools = {
                 name: ds.map(tokenize_fn, batched=True, load_from_cache_file=False)
                 for name, ds in pools.items()
             }
+            # Barrera: todos los ranks deben terminar la preparación del dataset antes de entrenar.
+            # Sin esto, el nodo más lento llega al init NCCL de DeepSpeed después del timeout del otro.
+            self.parent.accelerator.wait_for_everyone()
 
             for rep in range(cfg["run_config"]["num_replicas"]):
                 for treat_name, pool_ds in pools.items():
@@ -383,6 +379,11 @@ class CLASE_LOT_and_STATS:
 
                         batch_size = cfg["training_config"]["per_device_train_batch_size"]
                         ds_config = self._build_ds_config(batch_size) if use_deepspeed else None
+
+                        # Barrera crítica: from_pretrained + SVD pueden tardar distinto en cada nodo.
+                        # Si un rank llega antes al init NCCL de DeepSpeed, agota el timeout esperando al otro.
+                        self.parent.accelerator.wait_for_everyone()
+
                         trainer = Trainer(
                             model=peft_model,
                             args=TrainingArguments(
@@ -411,6 +412,9 @@ class CLASE_LOT_and_STATS:
                         del trainer
                         gc.collect()
                         torch.cuda.empty_cache()
+                        # Barrera entre iteraciones: evita que la siguiente iteración inicie NCCL
+                        # en un rank mientras el otro aún está liberando memoria o cerrando el engine.
+                        self.parent.accelerator.wait_for_everyone()
 
                         ppl = self.calculate_ppl(peft_model, pool_ds)
 
